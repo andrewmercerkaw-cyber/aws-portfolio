@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Mo's Custom Creations</title>
+  <meta name="description" content="Your Business Name - Quality service with a personal touch">
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@600&family=Inter:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root { --accent: #6495ED; --ink: #1f2328; --muted: #5b6168; --bg: #fbfaf7; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Inter', sans-serif; color: var(--ink); background: var(--bg); line-height: 1.6; }
+    a { color: var(--accent); }
+    nav { display: flex; justify-content: space-between; align-items: center; padding: 18px 6%; background: #fff; border-bottom: 1px solid #eee; position: sticky; top: 0; }
+    nav .logo { font-family: 'Playfair Display', serif; font-size: 1.4rem; }
+    nav ul { list-style: none; display: flex; gap: 24px; }
+    nav ul a { text-decoration: none; color: var(--ink); font-weight: 500; }
+    .hero { padding: 110px 6%; text-align: center; background: linear-gradient(135deg, var(--accent), #1c3d35); color: #fff; }
+    .hero h1 { font-family: 'Playfair Display', serif; font-size: clamp(2.2rem, 5vw, 3.6rem); margin-bottom: 12px; }
+    .hero p { font-size: 1.2rem; opacity: .9; margin-bottom: 28px; }
+    .btn { display: inline-block; background: #fff; color: var(--accent); padding: 12px 28px; border-radius: 6px; text-decoration: none; font-weight: 500; }
+    section { padding: 80px 6%; max-width: 1100px; margin: 0 auto; }
+    h2 { font-family: 'Playfair Display', serif; font-size: 2rem; margin-bottom: 20px; text-align: center; }
+    .about p { max-width: 720px; margin: 0 auto; text-align: center; color: var(--muted); font-size: 1.1rem; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 24px; margin-top: 30px; }
+    .card { background: #fff; padding: 28px; border-radius: 10px; border: 1px solid #eee; }
+    .card h3 { color: var(--accent); margin-bottom: 8px; }
+    .card p { color: var(--muted); }
+    .contact .grid .card { text-align: center; }
+    footer { text-align: center; padding: 30px; color: var(--muted); font-size: .9rem; border-top: 1px solid #eee; }
+    @media (max-width: 600px) { nav ul { display: none; } }
+  </style>
+</head>
+<body>
+  <nav>
+    <div class="logo">Mo's Custom Creations>/div>
+    <ul>
+      <li><a href="#about">About</a></li>
+      <li><a href="#services">Services</a></li>
+      <li><a href="#contact">Contact</a></li>
+    </ul>
+  </nav>
+
+  <header class="hero">
+    <h1>Mo's Custom Creations</h1>
+    <p>Quality service with a personal touch</p>
+    <a class="btn" href="#contact">Get in Touch</a>
+  </header>
+
+  <section id="about" class="about">
+    <h2>About Us</h2>
+    <p>We are a locally owned business dedicated to serving our community. Tell your story here: how you started, what you care about, and why customers choose you.</p>
+  </section>
+
+  <section id="services">
+    <h2>What We Offer</h2>
+    <div class="grid">
+      <div class="card"><h3>Service One</h3><p>Add a personal mark to your daily carry with our custom laser-engraved leather keychains. Cut from durable, full-grain leather and precision-etched with high-detail graphics, names, coordinates, or company logos, each piece develops a rich, distinct patina over time. Built with heavy-duty hardware to handle everyday wear without fading or peeling..</p></div>
+      <div class="card"><h3>Service Two</h3><p>A short description of your second service or product.</p></div>
+      <div class="card"><h3>Service Three</h3><p>A short description of your third service or product.</p></div>
+    </div>
+  </section>
+
+  <section id="contact" class="contact">
+    <h2>Contact</h2>
+    <div class="grid">
+      <div class="card"><h3>Call</h3><p><a href="tel:(555) 555-5555">(555) 555-5555</a></p></div>
+      <div class="card"><h3>Email</h3><p><a href="mailto:hello@yourbusiness.com">hello@yourbusiness.com</a></p></div>
+      <div class="card"><h3>Visit</h3><p>Peru, Indiana<br>Mon-Fri 9am-5pm | Sat 10am-2pm</p></div>
+    </div>
+  </section>
+
+  <footer>&copy; 2026 Your Business Name. All rights reserved.</footer>
+</body>
+</html>

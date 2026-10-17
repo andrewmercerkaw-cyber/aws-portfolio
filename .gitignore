@@ -1,0 +1,6 @@
+   .aws/
+   *.csv
+   *credentials*
+   *.pem
+   *.key
+   .env
