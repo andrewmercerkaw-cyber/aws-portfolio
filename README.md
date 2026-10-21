@@ -32,12 +32,22 @@ only for me).
 *Technical: Amazon EC2, user data scripts, IAM roles, security groups, instance
 metadata, Elastic IPs* → [See Phase 2](phase-02-ec2/)
 
-### Phase 3: Keeping the site up if a server fails (next)
-**In plain English:** I'll make a reusable copy of the server and run several at once,
-with a traffic director in front. If one server fails, another automatically takes its
-place, and visitors never notice.
+### Phase 3: Giving the website its own storage ✅
+**In plain English:** In Phase 2, the website lived on the server's own disk, so losing
+the server meant losing the site. I moved the website onto a separate, encrypted disk that
+survives the server being deleted, made a backup copy and restored it in a different
+data center, saved a ready-to-go copy of the whole server so new ones start in seconds,
+and set up shared storage so two servers in two data centers show the exact same files.
 
-*Technical: EBS, custom AMIs, Elastic Load Balancing, Auto Scaling*
+*Technical: EBS volumes, fstab mounts, EBS snapshots, cross-AZ restore, encryption by
+default, golden AMIs, Amazon EFS, security-group-referenced NFS rules* → [See Phase 3](phase-03-storage/)
+
+### Phase 4: Keeping the site up if a server fails (next)
+**In plain English:** I'll run several copies of the server at once, with a traffic
+director in front. If one server fails, another automatically takes its place, and
+visitors never notice.
+
+*Technical: launch templates, Application Load Balancer, Auto Scaling groups, health checks*
 
 ## How I work
 - **Security first:** every phase follows least access and no stored passwords
@@ -71,6 +81,11 @@ Issues discovered during the build and how each was resolved.
 | F-03 | CLI default region (us-east-2) did not match the working region (us-east-1), so checks missed resources | Medium | Pre-flight check (Step 2.0.3) | Default region changed to us-east-1. Checks now name the region explicitly when needed. | Closed |
 | F-04 | `.gitignore` initially created as a folder instead of a file, so ignore rules were not active | Medium | `git status` review before first commit (Step 1.7.3) | Files moved to the repository root and re-verified before committing | Closed |
 | F-05 | Direct `IAMReadOnlyAccess` policy on `Andrew` duplicates permissions already granted by the `admin` group | Low | Policy review (Step 1.3) | Detach with `aws iam detach-user-policy` so all permissions come from the group | Verify |
+| F-06 | Console was set to us-east-2 (Ohio) while the build targets us-east-1, so the security group and key pair appeared to be missing | Medium | Launch wizard subnet list showed `us-east-2b` (Step 3.1.2) | Switched console region to N. Virginia before creating anything | Closed |
+| F-07 | `mos-web-1` launched with an auto-created `launch-wizard-2` security group that allowed no HTTP, so the site timed out | Medium | Browser timeout, then `curl localhost` returned 200 and `describe-instances` showed the wrong group (Step 3.2.4) | Swapped to `mos-staging-sg`, added an EC2 Instance Connect prefix-list rule to it, and deleted `launch-wizard-2` | Closed |
+| F-08 | `mos-web-2` launched without user data, so Apache was not installed and `/var/www/html` did not exist | Medium | Mount failed; cloud-init log finished in 11 s with no package installs (Step 3.3.5) | Installed Apache manually. Prevention: launch templates in Phase 4 | Closed |
+| F-09 | Restored volume was created but never attached, so the OS could not see it | Low | `lsblk` showed only the root disk; `describe-volumes` showed no attachment (Step 3.3.4) | Attached with `aws ec2 attach-volume` and re-checked with `lsblk` | Closed |
+| F-10 | `status.html` is generated once at build time, so copies made from a snapshot or AMI report the original server's AZ | Low | Browser check on the restored and AMI-launched servers (Steps 3.3.6, 3.4.3) | Accepted for now; regenerate the page at every boot in Phase 4 | Open |
 
 ### Accepted Risks
 
@@ -82,7 +97,9 @@ Known gaps that are acceptable for a short-lived lab, with the planned productio
 | R-02 | `AmazonS3ReadOnlyAccess` grants read access to every bucket, which is more than the workload needs | Used only to prove the role works, and no buckets exist | Replace with a custom policy scoped to specific buckets, or remove it |
 | R-03 | The site is served over HTTP, not HTTPS | Staging only, no user data collected | Add a TLS certificate (AWS Certificate Manager) on a load balancer or CloudFront |
 | R-04 | The admin user uses a long-lived CLI access key | Single user, key used from one machine | Move to IAM Identity Center with short-lived credentials, then deactivate the key. Deferred because enabling it creates an AWS Organization, which affects account plan and credit eligibility. |
-| R-05 | Single instance, single Availability Zone | Staging only | Load balancer plus Auto Scaling across multiple Availability Zones (Phase 3) |
+| R-05 | Single instance, single Availability Zone | Staging only | Load balancer plus Auto Scaling across multiple Availability Zones (Phase 4) |
+| R-06 | EFS automatic backups disabled | Lab data only, recreated from the repo | Enable AWS Backup for EFS, or keep automatic backups on |
+| R-07 | Manual `mount` of EFS not added to fstab, so it would not survive a reboot | Short-lived lab | Add an `efs` entry with `_netdev,tls` to fstab, or mount from user data |
 
 ### Phase 1: Account Security Baseline
 
@@ -253,9 +270,92 @@ Known gaps that are acceptable for a short-lived lab, with the planned productio
 
 </details>
 
+### Phase 3: EC2 Storage
+
+**Objective:** Separate the website's content from the server that serves it, so content survives server loss, can be backed up and moved between Availability Zones, can be baked into a reusable image, and can be shared by several servers at once.
+
+**Design principles:**
+1. Content lives on storage that outlives any one server.
+2. All data at rest is encrypted by default.
+3. Backups are proven by restoring them, not assumed.
+4. Shared storage only accepts traffic from the web tier's security group.
+5. Every storage resource is deleted and verified after use, in dependency order.
+
+<details>
+<summary><b>Show every step and sub-step with rationale</b></summary>
+
+#### Step 3.0: Fresh start
+
+| Sub-step | Action | Why | Pillar | Evidence |
+|---|---|---|---|---|
+| 3.0.1 | Listed instances, volumes, snapshots, AMIs, Elastic IPs, and EFS file systems | Course labs commonly leave snapshots and AMIs that bill monthly. Confirms costs from this phase are attributable to it. | COST | All empty in us-east-1 |
+| 3.0.2 | Confirmed the role, security group, and key pair from Phase 2 still existed | Reuse avoids rebuilding known-good, already-reviewed configuration. | OPS | `get-role`, `describe-security-groups` returned values |
+| 3.0.3 | Enabled EBS encryption by default for us-east-1 | Every new volume and snapshot is encrypted at rest with no per-volume step that could be forgotten. Free, and transparent to the instance. | SEC | `aws ec2 get-ebs-encryption-by-default` returns `true` |
+
+#### Step 3.1: Web server rebuilt from code
+
+| Sub-step | Action | Why | Pillar | Evidence |
+|---|---|---|---|---|
+| 3.1.1 | Launched `mos-web-1` in us-east-1a from the Phase 2 user data script | Proves the server is reproducible from version-controlled code after a full account cleanup. | OPS, REL | Site loads; status page shows us-east-1a |
+| 3.1.2 | Corrected the console region before launching | Security groups and key pairs are regional; launching in the wrong region would create a disconnected stack (F-06). | OPS | Subnet list shows us-east-1 AZs |
+| 3.1.3 | Tagged `Project=phase-03` on instance and volumes | Makes every resource from this phase easy to find during teardown and cost review. | COST | Instance and volume tags |
+
+#### Step 3.2: Dedicated EBS data volume
+
+| Sub-step | Action | Why | Pillar | Evidence |
+|---|---|---|---|---|
+| 3.2.1 | Created a 1 GiB encrypted gp3 volume `mos-site-data` in us-east-1a | Separates content from the OS disk. An EBS volume can only attach in its own AZ, so it was created alongside the instance. Sized to the workload. | REL, COST | Volume in us-east-1a, Encrypted |
+| 3.2.2 | Confirmed the volume was blank with `file -s` before formatting with XFS | Formatting erases data. Checking first prevents wiping a volume that already holds content. | REL | `file -s` returned `data` |
+| 3.2.3 | Backed up the web root, mounted the volume over `/var/www/html`, and restored the files | Moves the live site onto the new volume without downtime or data loss. | REL | `df -h` shows `/dev/nvme1n1` on `/var/www/html` |
+| 3.2.4 | Diagnosed a browser timeout | `curl localhost` returned 200, proving the server was healthy and isolating the fault to the network. Found the wrong security group (F-07). | SEC, OPS | `curl -I` output, `describe-instances` |
+| 3.2.5 | Added an fstab entry by UUID with `nofail`, then tested with `umount` and `mount -a` | The UUID never changes, unlike `nvme` device names. `nofail` lets the server boot even if the volume is missing. Testing the entry before rebooting avoids an unbootable server. | REL | fstab line, `mount -a` with no errors |
+| 3.2.6 | Rebooted and re-checked | Proves the mount and web server both return automatically. | REL | `/volume.html` loads after reboot |
+
+#### Step 3.3: Snapshot backup and cross-AZ restore
+
+| Sub-step | Action | Why | Pillar | Evidence |
+|---|---|---|---|---|
+| 3.3.1 | Took a snapshot of `mos-site-data` | Snapshots are stored regionally and can be restored into any AZ, which is how EBS data is backed up and moved. | REL | Snapshot status Completed |
+| 3.3.2 | Created `after.html` after the snapshot started | Gives a test that distinguishes a point-in-time copy from a live copy. | REL | File present on web 1 |
+| 3.3.3 | Launched `mos-web-2` in us-east-1b and restored the snapshot to a new volume in us-east-1b | Demonstrates recovery of the site's data in a different AZ. | REL | Volume and instance both in us-east-1b |
+| 3.3.4 | Attached the restored volume and verified the OS saw it | A volume must be attached before the OS can use it (F-09). | OPS | `lsblk` shows a 1 GiB `nvme1n1` |
+| 3.3.5 | Checked `file -s` and mounted without formatting | `XFS filesystem data` confirms existing content. Running `mkfs` here would have destroyed the backup. Found missing user data (F-08). | REL | `file -s` output, cloud-init log |
+| 3.3.6 | Loaded `/volume.html`, `/after.html`, and `/status.html` | Pass/fail proof: the snapshot content arrived, later changes did not, and the data came from web 1. | REL | volume.html loads, after.html 404, status shows us-east-1a |
+| 3.3.7 | Terminated `mos-web-2` and deleted the restored volume | Added volumes do not delete on termination by default and would keep billing. | COST | Volume deleted |
+
+#### Step 3.4: Golden AMI
+
+| Sub-step | Action | Why | Pillar | Evidence |
+|---|---|---|---|---|
+| 3.4.1 | Created `mos-web-golden-v1` from `mos-web-1` with reboot enabled | Captures a fully configured server, including its data volume. The reboot gives a consistent image. | REL, OPS | AMI status Available, two backing snapshots |
+| 3.4.2 | Launched an instance from the AMI in us-east-1b with no user data | Proves new servers can start ready to serve without installing anything, which is the basis for Auto Scaling in Phase 4. | REL | Site and volume.html load immediately |
+| 3.4.3 | Noted the status page still showed us-east-1a | Anything generated at build time is frozen into the image (F-10). | OPS | Browser check |
+
+#### Step 3.5: Shared storage with EFS
+
+| Sub-step | Action | Why | Pillar | Evidence |
+|---|---|---|---|---|
+| 3.5.1 | Created `mos-efs-sg` allowing NFS (2049) only from `mos-staging-sg` | Referencing a security group instead of an IP range lets any web server in that group connect, and nothing else, no matter how many servers exist or what their IPs are. | SEC | Inbound rule source is `mos-staging-sg` |
+| 3.5.2 | Created Regional file system `mos-shared` with mount targets in us-east-1a and us-east-1b using `mos-efs-sg` | Regional EFS is multi-AZ. The default security group was replaced so access follows rule 3.5.1. Automatic backups were turned off for cost (R-06). | SEC, REL, COST | Mount targets Available |
+| 3.5.3 | Installed `amazon-efs-utils` and mounted with `-o tls` on both servers | The EFS helper handles the mount, and `tls` encrypts data in transit between server and file system. | SEC | `df -h` on both servers |
+| 3.5.4 | Wrote a page from web 1, then edited it from the AMI server | Proves both servers in different AZs read and write the same files, which is what lets servers behind a load balancer show the same site. | REL | `/shared/` identical on both servers after each edit |
+
+#### Step 3.6: Teardown
+
+| Sub-step | Action | Why | Pillar | Evidence |
+|---|---|---|---|---|
+| 3.6.1 | Terminated all instances | Servers are disposable and reproducible from code or the AMI. | COST | Instances terminated |
+| 3.6.2 | Deleted all available volumes | Data volumes and the AMI's data volume were not set to delete on termination. | COST | `describe-volumes` empty |
+| 3.6.3 | Deregistered the AMI, then deleted all snapshots | AWS blocks deleting a snapshot that an AMI still uses, so order matters. | COST | `describe-images` and `describe-snapshots` empty |
+| 3.6.4 | Deleted the EFS file system, then `mos-efs-sg` and leftover `launch-wizard` groups | Mount targets must be gone before their security group can be deleted. Removing unused groups keeps the account auditable. | COST, SEC | `describe-file-systems` empty |
+| 3.6.5 | Kept the role, `mos-staging-sg`, key pair, and encryption setting | Free, reviewed, and reused in Phase 4. | COST | Listed in IAM and EC2 |
+
+</details>
+
 ### Change Log
 
 | Date | Change |
 |---|---|
 | 2026-10-17 | Phase 1 completed and committed |
 | 2026-10-19 | Phase 2 completed and committed. F-02 and F-03 found and resolved. |
+| 2026-10-21 | Phase 3 completed. EBS encryption by default enabled. F-06 to F-10 found; F-06 to F-09 resolved. |
