@@ -42,12 +42,19 @@ and set up shared storage so two servers in two data centers show the exact same
 *Technical: EBS volumes, fstab mounts, EBS snapshots, cross-AZ restore, encryption by
 default, golden AMIs, Amazon EFS, security-group-referenced NFS rules* → [See Phase 3](phase-03-storage/)
 
-### Phase 4: Keeping the site up if a server fails (next)
-**In plain English:** I'll run several copies of the server at once, with a traffic
-director in front. If one server fails, another automatically takes its place, and
-visitors never notice.
+### Phase 4: Keeping the site up if a server fails ✅
+**In plain English:** I put a "traffic director" (a load balancer) in front of the site and
+ran copies of the server in two separate data centers. Visitors are spread across them
+automatically. When I broke a server on purpose, it was detected in about 20 seconds and
+replaced with a fresh one without me touching anything, and the site never went down. When
+I pushed the servers hard, a third server was added automatically to handle the load.
 
-*Technical: launch templates, Application Load Balancer, Auto Scaling groups, health checks*
+*Technical: launch templates, Application Load Balancer, target groups and health checks,
+Auto Scaling groups across two AZs, target tracking scaling, CloudWatch alarms,
+security-group chaining* → [See Phase 4](phase-04-elb-asg/)
+
+### Phase 5: Next
+Following the course: databases, then a real domain name with HTTPS.
 
 ## How I work
 - **Security first:** every phase follows least access and no stored passwords
@@ -85,7 +92,14 @@ Issues discovered during the build and how each was resolved.
 | F-07 | `mos-web-1` launched with an auto-created `launch-wizard-2` security group that allowed no HTTP, so the site timed out | Medium | Browser timeout, then `curl localhost` returned 200 and `describe-instances` showed the wrong group (Step 3.2.4) | Swapped to `mos-staging-sg`, added an EC2 Instance Connect prefix-list rule to it, and deleted `launch-wizard-2` | Closed |
 | F-08 | `mos-web-2` launched without user data, so Apache was not installed and `/var/www/html` did not exist | Medium | Mount failed; cloud-init log finished in 11 s with no package installs (Step 3.3.5) | Installed Apache manually. Prevention: launch templates in Phase 4 | Closed |
 | F-09 | Restored volume was created but never attached, so the OS could not see it | Low | `lsblk` showed only the root disk; `describe-volumes` showed no attachment (Step 3.3.4) | Attached with `aws ec2 attach-volume` and re-checked with `lsblk` | Closed |
-| F-10 | `status.html` is generated once at build time, so copies made from a snapshot or AMI report the original server's AZ | Low | Browser check on the restored and AMI-launched servers (Steps 3.3.6, 3.4.3) | Accepted for now; regenerate the page at every boot in Phase 4 | Open |
+| F-10 | `status.html` is generated once at build time, so copies made from a snapshot or AMI report the original server's AZ | Low | Browser check on the restored and AMI-launched servers (Steps 3.3.6, 3.4.3) Status page now rebuilt at every boot by a cloud-init per-boot script (Phase 4, Step 4.3) | Closed |
+| F-11 | The Instance Connect SSH rule used the IPv6 prefix list, so console connections would fail | Low | CLI check showed `pl-09f9...` (`.ipv6`) (Step 4.2.3) | Replaced it with the IPv4 prefix list | Closed |
+| F-12 | Editing a rule's source in place broke the web servers' HTTP rule, leaving port 80 with no source | Medium | CLI check of `mos-web-sg` (Step 4.2.3) | Deleted and recreated both rules, then verified the full rule set with the CLI | Closed |
+| F-13 | `mos-alb-sg` had no inbound rules, so the load balancer would refuse all visitors | High | Console flagged the listener **Not reachable** (Step 4.6.2) | Added HTTP from 0.0.0.0/0 with `authorize-security-group-ingress` | Closed |
+| F-14 | Launch template and target group didn't save on the first console attempt | Low | `NotFound` errors from CLI checks (Steps 4.4, 4.5) | Re-created the template; created the target group from the CLI | Closed |
+| F-15 | A check reported the launch template had no IAM role, when it did | Low | The query read the role's name, but the console saves its ARN (Step 4.4.3) | No change needed. Lesson: verify the check before changing the resource | Closed |
+| F-16 | Load test held the group at exactly 50% average CPU, so it never scaled out | Low | CloudWatch showed a flat ~50% (Step 4.10.3) | stress-ng was only on one server; ran it on both with `nohup` | Closed |
+| F-17 | Teardown left the Auto Scaling group and 3 servers running after the load balancer was deleted | Medium | Teardown verification (Step 4.11.2) | Force-deleted the group. Correct order is Auto Scaling group first | Closed |
 
 ### Accepted Risks
 
@@ -97,9 +111,11 @@ Known gaps that are acceptable for a short-lived lab, with the planned productio
 | R-02 | `AmazonS3ReadOnlyAccess` grants read access to every bucket, which is more than the workload needs | Used only to prove the role works, and no buckets exist | Replace with a custom policy scoped to specific buckets, or remove it |
 | R-03 | The site is served over HTTP, not HTTPS | Staging only, no user data collected | Add a TLS certificate (AWS Certificate Manager) on a load balancer or CloudFront |
 | R-04 | The admin user uses a long-lived CLI access key | Single user, key used from one machine | Move to IAM Identity Center with short-lived credentials, then deactivate the key. Deferred because enabling it creates an AWS Organization, which affects account plan and credit eligibility. |
-| R-05 | Single instance, single Availability Zone | Staging only | Load balancer plus Auto Scaling across multiple Availability Zones (Phase 4) |
+| R-05 | Single instance, single Availability Zone | Staging only Load balancer plus Auto Scaling across two AZs, demonstrated in Phase 4 |
 | R-06 | EFS automatic backups disabled | Lab data only, recreated from the repo | Enable AWS Backup for EFS, or keep automatic backups on |
 | R-07 | Manual `mount` of EFS not added to fstab, so it would not survive a reboot | Short-lived lab | Add an `efs` entry with `_netdev,tls` to fstab, or mount from user data |
+| R-08 | Servers skip `dnf update` at launch so they pass health checks faster | Short-lived lab servers | Patch a golden AMI on a schedule (EC2 Image Builder) and launch from it |
+| R-09 | The load balancer serves HTTP only | No domain or certificate yet | Add an ACM certificate on an HTTPS listener and redirect HTTP to HTTPS (closes R-03) |
 
 ### Phase 1: Account Security Baseline
 
@@ -352,6 +368,109 @@ Known gaps that are acceptable for a short-lived lab, with the planned productio
 
 </details>
 
+### Phase 4: Load Balancing and Auto Scaling
+
+**Objective:** Serve the site through a single load balancer in front of servers in two Availability Zones, so that a failed server is detected and replaced automatically, load is spread evenly, and capacity grows with demand.
+
+**Design principles:**
+1. Visitors reach servers only through the load balancer.
+2. Every server is launched from one versioned template, so no setting can be forgotten.
+3. Health is judged by whether the website answers, not just whether the server is on.
+4. Capacity is spread across two AZs and never drops below two servers.
+5. Teardown follows dependency order, starting with the Auto Scaling group.
+
+<details>
+<summary><b>Show every step and sub-step with rationale</b></summary>
+
+#### Step 4.1: Pre-flight check
+
+| Sub-step | Action | Why | Pillar | Evidence |
+|---|---|---|---|---|
+| 4.1.1 | Confirmed no instances, load balancers, target groups, Auto Scaling groups, or launch templates existed | A leftover Auto Scaling group relaunches anything you terminate, and a load balancer bills hourly even when idle. | COST | Empty `describe-*` output |
+| 4.1.2 | Confirmed the IAM role and EBS encryption by default still existed | Reuses reviewed configuration from earlier phases. | SEC, OPS | Role ARN returned; encryption `true` |
+
+#### Step 4.2: Chained security groups
+
+| Sub-step | Action | Why | Pillar | Evidence |
+|---|---|---|---|---|
+| 4.2.1 | Created `mos-alb-sg` allowing HTTP from anywhere | The load balancer is the only public entry point. | SEC | Inbound rule 80 from 0.0.0.0/0 |
+| 4.2.2 | Created `mos-web-sg` allowing HTTP only from `mos-alb-sg`, and SSH only from the EC2 Instance Connect prefix list | Referencing the load balancer's security group (not its IPs, which change) means servers can't be reached by going around it. SSH is limited to AWS's Instance Connect service. | SEC | `UserIdGroupPairs` shows `mos-alb-sg`; port 22 shows `pl-0e4b...` |
+| 4.2.3 | Verified both groups with the CLI after each change | Caught the wrong prefix list (F-11) and a broken HTTP rule (F-12) before anything launched. | SEC, OPS | `describe-security-groups` output |
+
+#### Step 4.3: User data with a per-boot status page
+
+| Sub-step | Action | Why | Pillar | Evidence |
+|---|---|---|---|---|
+| 4.3.1 | Wrote `user-data.sh` to install Apache and Git and deploy the site from this repo | Every server is built identically from version-controlled code. | OPS, REL | `phase-04-elb-asg/user-data.sh` |
+| 4.3.2 | Installed a script in `/var/lib/cloud/scripts/per-boot/` that rebuilds `status.html` from instance metadata (IMDSv2) | User data runs once; per-boot scripts run on every start, so the page is always accurate. Closes F-10. | OPS | Each server reported its own AZ in Step 4.8 |
+| 4.3.3 | Omitted `dnf update` | Faster boots help new servers pass health checks within the grace period. Accepted as R-08. | REL | Healthy ~3 min after launch |
+| 4.3.4 | Saved the script with LF line endings | Windows CRLF endings break the `#!/bin/bash` line on Linux. | OPS | VS Code status bar |
+
+#### Step 4.4: Launch template
+
+| Sub-step | Action | Why | Pillar | Evidence |
+|---|---|---|---|---|
+| 4.4.1 | Created `mos-web-lt`: Amazon Linux 2023, t3.micro, `mos-web-sg` only, IAM role, IMDSv2 required, user data, no subnet | One saved definition removes the launch mistakes from Phase 3 (F-07, F-08). Subnets are left to the Auto Scaling group. | SEC, OPS | `describe-launch-template-versions` |
+| 4.4.2 | Tagged instances and volumes `Project=phase-04` | Supports cost tracking and teardown checks. | COST | Template tags |
+| 4.4.3 | Created version 2 and set it as the default | Launch templates are versioned, not edited in place, which allows rollback. The trigger was a false alarm from a check that read the wrong field (F-15). | OPS | Both versions show the role ARN |
+
+#### Step 4.5: Target group and health check
+
+| Sub-step | Action | Why | Pillar | Evidence |
+|---|---|---|---|---|
+| 4.5.1 | Created `mos-web-tg` (HTTP:80, instances) from the CLI | The CLI produces an exact, repeatable record of the configuration (F-14). | OPS | `create-target-group` command in `commands.ps1` |
+| 4.5.2 | Health check on `/index.html`, 10 s interval, 2 to pass, 2 to fail, 200 OK only | Checks that the real site loads, not just that a port is open. Detects failure in about 20 seconds instead of the default minutes. | REL | Target group settings |
+| 4.5.3 | Registered no targets by hand | The Auto Scaling group registers and deregisters servers automatically. | OPS | Empty target list at creation |
+
+#### Step 4.6: Application Load Balancer
+
+| Sub-step | Action | Why | Pillar | Evidence |
+|---|---|---|---|---|
+| 4.6.1 | Created internet-facing `mos-web-alb` in us-east-1a and us-east-1b with only `mos-alb-sg` | Two AZs keep the entry point available if one AZ fails. The default security group was removed so access follows Step 4.2. | REL, SEC | Load balancer settings |
+| 4.6.2 | Listener HTTP:80 forwards to `mos-web-tg` | Single front door for all servers. The console's **Not reachable** warning exposed a missing rule (F-13) before any visitor was affected. | REL | Listener rules |
+
+#### Step 4.7: Auto Scaling group
+
+| Sub-step | Action | Why | Pillar | Evidence |
+|---|---|---|---|---|
+| 4.7.1 | Created `mos-web-asg` from the template's default version, in us-east-1a and us-east-1b | Spreads servers across AZs; if one AZ fails, replacements launch in the other. | REL | Instances in both AZs |
+| 4.7.2 | Attached to `mos-web-tg` and turned on ELB health checks | With EC2 checks alone, a server whose website crashed would stay in service. ELB checks replace it. | REL | Group health check type ELB |
+| 4.7.3 | Set a 120-second health check grace period | User data needs time to finish before a new server is judged; without it, new servers would be killed while booting. | REL | ~3 min to healthy, no false terminations |
+| 4.7.4 | Set min 2, desired 2, max 4 | Two servers minimum for availability; headroom to scale; a cap on cost. | REL, COST | Group capacity settings |
+
+#### Step 4.8: Load balancing verification
+
+| Sub-step | Action | Why | Pillar | Evidence |
+|---|---|---|---|---|
+| 4.8.1 | Requested `/status.html` through the ALB 10 times | Shows requests spread across both AZs (round robin) and confirms F-10 is fixed. | REL | Alternating us-east-1a / us-east-1b |
+| 4.8.2 | Opened a server's public IP directly | Proves `mos-web-sg` blocks traffic that bypasses the load balancer. | SEC | Connection timed out |
+
+#### Step 4.9: Self-healing test
+
+| Sub-step | Action | Why | Pillar | Evidence |
+|---|---|---|---|---|
+| 4.9.1 | Stopped Apache on one server | Simulates an application failure on a server whose hardware is fine. | REL | `systemctl stop httpd` |
+| 4.9.2 | Watched target health and scaling activity | Unhealthy in ~20 s; the ALB stopped routing to it; Auto Scaling terminated it with connection draining and launched a replacement 1 second later; healthy ~3 min after. The site stayed up throughout. | REL | Scaling activity: "ELB system health check failure" |
+
+#### Step 4.10: Scaling policy and load test
+
+| Sub-step | Action | Why | Pillar | Evidence |
+|---|---|---|---|---|
+| 4.10.1 | Created target tracking policy `mos-cpu-50` (average CPU 50%, 120 s warmup) | Keeps average CPU near a target; AWS manages the CloudWatch alarms. Recommended for most workloads. | REL, COST | AlarmHigh and AlarmLow created |
+| 4.10.2 | Generated load with `stress-ng` under `nohup` on both servers | `nohup` keeps the load running after the session closes; both servers are needed because the policy uses the group average. | REL | CPU datapoints |
+| 4.10.3 | Diagnosed a flat 50% average | One server at 100% and one at 0% averages exactly 50%, which never exceeds the target (F-16). | OPS | CloudWatch metric output |
+| 4.10.4 | Observed scale-out | AlarmHigh fired and the policy raised desired capacity from 2 to 3; a third server launched and passed checks. | REL | Scaling activity naming `mos-cpu-50` |
+
+#### Step 4.11: Teardown
+
+| Sub-step | Action | Why | Pillar | Evidence |
+|---|---|---|---|---|
+| 4.11.1 | Deleted the load balancer, target group, and launch template | The load balancer bills hourly; the target group can't be deleted while a listener uses it. | COST | Empty `describe-*` output |
+| 4.11.2 | Force-deleted the Auto Scaling group after verification showed it still running | A live group keeps replacing servers. The correct order is the group first (F-17). Deleting it also removed its scaling policy and alarms. | COST | Empty group, instance, volume, and alarm lists |
+| 4.11.3 | Kept both security groups and the IAM role | Free, reviewed, and reusable. | COST | Listed in EC2 and IAM |
+
+</details>
+
 ### Change Log
 
 | Date | Change |
@@ -359,3 +478,4 @@ Known gaps that are acceptable for a short-lived lab, with the planned productio
 | 2026-10-17 | Phase 1 completed and committed |
 | 2026-10-19 | Phase 2 completed and committed. F-02 and F-03 found and resolved. |
 | 2026-10-21 | Phase 3 completed. EBS encryption by default enabled. F-06 to F-10 found; F-06 to F-09 resolved. |
+| 2026-10-23 | Phase 4 completed. F-10 closed; F-11 to F-17 found and resolved. |
